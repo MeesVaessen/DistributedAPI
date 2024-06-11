@@ -1,0 +1,94 @@
+image: mcr.microsoft.com/dotnet/core/sdk:latest
+
+variables:
+  OBJECTS_DIRECTORY: 'obj'
+  DOCKER_IMAGE_NAME_BACKEND: "backend"
+  DOCKER_IMAGE_NAME_NGINX: "reverse-proxy"
+  NUGET_PACKAGES_DIRECTORY: '.nuget'
+  SOURCE_CODE_PATH: '*/*/'
+  DOCKER_IMAGE_TAG: latest
+  NPM_CACHE_DIR: "$CI_PROJECT_DIR/.npm"
+  DOCKER_BUILDKIT: 1
+
+
+cache:
+  key: "$CI_JOB_STAGE-$CI_COMMIT_REF_SLUG"
+  paths:
+
+    - '$SOURCE_CODE_PATH$OBJECTS_DIRECTORY/project.assets.json' 
+    - '$SOURCE_CODE_PATH$OBJECTS_DIRECTORY/*.csproj.nuget.*'
+    - '$NUGET_PACKAGES_DIRECTORY'
+
+  policy: pull-push
+
+
+stages:
+    - Build
+    - Sonarqube
+    - Docker-Push
+    - Test-Env-Deploy
+
+build-API:
+  stage: Build
+  image: mcr.microsoft.com/dotnet/sdk:7.0
+  script:
+    - 'dotnet build ./Backend/Api/'
+
+
+sonarqube-check:
+  stage: Sonarqube
+  image: mcr.microsoft.com/dotnet/sdk:7.0
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  
+    GIT_DEPTH: "0" 
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script: 
+      - "apt-get update"
+      - "apt-get install --yes --no-install-recommends openjdk-17-jre"
+      - "dotnet tool install --global dotnet-sonarscanner"
+      - "dotnet tool install --global dotnet-coverage"
+      - "export PATH=\"$PATH:$HOME/.dotnet/tools\""
+      - "dotnet sonarscanner begin /k:\"Backend\" /d:sonar.token=\"$SONAR_TOKEN\" /d:\"sonar.host.url=$SONAR_HOST_URL\" /d:sonar.cs.vscoveragexml.reportsPaths=coverage.xml /d:sonar.coverage.exclusions=/#Migrations/ /d:sonar.exclusions=**/Migrations/** /d:sonar.qualitygate.wait=true /d:sonar.qualitygate.timeout=300"
+      - "dotnet build ./Backend/"
+      - "dotnet sonarscanner end /d:sonar.token=\"$SONAR_TOKEN\""
+  allow_failure: true
+  needs:
+      - build-API
+
+Docker-Push-Backend: 
+  stage: Docker-Push
+  image: docker:stable
+  services:
+    - docker:dind 
+  script:  
+    - mkdir backendimage
+    - docker build -t $DOCKER_IMAGE_NAME_BACKEND ./Backend/
+    - docker save $DOCKER_IMAGE_NAME_BACKEND > backendimage/$DOCKER_IMAGE_NAME_BACKEND.tar
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin 
+    - docker load -i backendimage/$DOCKER_IMAGE_NAME_BACKEND.tar
+    - docker tag $DOCKER_IMAGE_NAME_BACKEND  $CI_REGISTRY_USER/$DOCKER_IMAGE_NAME_BACKEND:$DOCKER_IMAGE_TAG
+    - docker push $CI_REGISTRY_USER/$DOCKER_IMAGE_NAME_BACKEND:$DOCKER_IMAGE_TAG
+  needs:
+    - sonarqube-check
+
+Docker-Push-Nginx:
+  stage: Docker-Push
+  image: docker:stable
+  services:
+    - docker:dind
+  script: 
+    - mkdir NginxImage
+    - docker build -t $DOCKER_IMAGE_NAME_NGINX ./
+    - docker save $DOCKER_IMAGE_NAME_NGINX > NginxImage/$DOCKER_IMAGE_NAME_NGINX.tar
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin 
+    - docker load -i NginxImage/$DOCKER_IMAGE_NAME_NGINX.tar
+    - docker tag $DOCKER_IMAGE_NAME_NGINX  $CI_REGISTRY_USER/$DOCKER_IMAGE_NAME_NGINX:$DOCKER_IMAGE_TAG
+    - docker push $CI_REGISTRY_USER/$DOCKER_IMAGE_NAME_NGINX:$DOCKER_IMAGE_TAG
+  needs:
+    - Docker-Push-Backend
+
+
+
